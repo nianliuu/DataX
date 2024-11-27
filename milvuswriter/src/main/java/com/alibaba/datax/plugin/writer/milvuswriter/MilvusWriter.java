@@ -13,6 +13,8 @@ import io.milvus.v2.common.DataType;
 import io.milvus.v2.service.collection.request.AddFieldReq;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.partition.request.CreatePartitionReq;
+import io.milvus.v2.service.partition.request.HasPartitionReq;
 import io.milvus.v2.service.vector.request.UpsertReq;
 import lombok.extern.slf4j.Slf4j;
 
@@ -56,19 +58,25 @@ public class MilvusWriter extends Writer {
         private MilvusBufferWriter milvusBufferWriter;
 
         private String collection = null;
+        private String partition = null;
         private JSONArray milvusColumnMeta;
 
-        private String schemaCreateMode = "createWhenTableNotExit";
+        private boolean enableDynamicSchema;
+
+        private String schemaCreateMode;
 
         @Override
         public void startWrite(RecordReceiver lineReceiver) {
             Record record = lineReceiver.getFromReader();
-            JsonObject data = milvusSinkConverter.convertByType(milvusColumnMeta, record);
-            milvusBufferWriter.write(data);
-            if(milvusBufferWriter.needCommit()){
-                log.info("Reached buffer limit, Committing data");
-                milvusBufferWriter.commit();
-                log.info("Data committed");
+            while(record != null){
+                JsonObject data = milvusSinkConverter.convertByType(milvusColumnMeta, record);
+                milvusBufferWriter.write(data);
+                if (milvusBufferWriter.needCommit()) {
+                    log.info("Reached buffer limit, Committing data");
+                    milvusBufferWriter.commit();
+                    log.info("Data committed");
+                }
+                record = lineReceiver.getFromReader();
             }
         }
 
@@ -78,6 +86,8 @@ public class MilvusWriter extends Writer {
             // get configuration
             Configuration writerSliceConfig = this.getPluginJobConf();
             this.collection = writerSliceConfig.getString(KeyConstant.COLLECTION);
+            this.partition = writerSliceConfig.getString(KeyConstant.PARTITION, null);
+            this.enableDynamicSchema = writerSliceConfig.getBool(KeyConstant.ENABLE_DYNAMIC_SCHEMA, true);
             this.milvusColumnMeta = JSON.parseArray(writerSliceConfig.getString(KeyConstant.COLUMN));
             this.schemaCreateMode = writerSliceConfig.getString(KeyConstant.schemaCreateMode) == null ?
                     "createWhenTableNotExit" : writerSliceConfig.getString(KeyConstant.schemaCreateMode);
@@ -94,7 +104,7 @@ public class MilvusWriter extends Writer {
             }
             this.milvusClientV2 = new MilvusClientV2(connectConfig);
             this.milvusSinkConverter = new MilvusSinkConverter();
-            this.milvusBufferWriter = new MilvusBufferWriter(milvusClientV2, collection, batchSize);
+            this.milvusBufferWriter = new MilvusBufferWriter(milvusClientV2, collection, partition, batchSize);
             log.info("Milvus writer initialized");
         }
         @Override
@@ -107,7 +117,7 @@ public class MilvusWriter extends Writer {
                     // create collection
                     log.info("Creating collection:{}", this.collection);
                     CreateCollectionReq.CollectionSchema collectionSchema = milvusSinkConverter.prepareCollectionSchema(milvusColumnMeta);
-
+                    collectionSchema.setEnableDynamicField(enableDynamicSchema);
                     CreateCollectionReq createCollectionReq = CreateCollectionReq.builder()
                             .collectionName(collection)
                             .collectionSchema(collectionSchema)
@@ -116,6 +126,18 @@ public class MilvusWriter extends Writer {
                 } else if (schemaCreateMode.equals("exception")) {
                     log.error("Collection not exist, throw exception");
                     throw new RuntimeException("Collection not exist");
+                }
+            }
+            if(partition != null) {
+                Boolean hasPartition = milvusClientV2.hasPartition(HasPartitionReq.builder().collectionName(collection).partitionName(partition).build());
+                if (!hasPartition) {
+                    log.info("Partition not exist, creating");
+                    CreatePartitionReq createPartitionReq = CreatePartitionReq.builder()
+                            .collectionName(collection)
+                            .partitionName(partition)
+                            .build();
+                    milvusClientV2.createPartition(createPartitionReq);
+                    log.info("Partition created");
                 }
             }
         }
